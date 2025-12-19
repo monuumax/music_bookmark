@@ -246,9 +246,38 @@ class EnhancedAudioPlayer(QMainWindow):
         if file_path:
             self.load_audio_file(file_path)
             
+    def resolve_bookmark_path(self, stored_path):
+        """
+        Resolve a stored path (could be relative or absolute) to an absolute path.
+        
+        Args:
+            stored_path: The path stored in the bookmark (could be relative or absolute)
+            
+        Returns:
+            Absolute file path
+        """
+        # If it's an absolute path, use it directly
+        if os.path.isabs(stored_path):
+            return stored_path
+        
+        # Otherwise, assume it's relative to the audio folder
+        return os.path.join(self.audio_folder, stored_path)
+            
     def load_audio_file(self, file_path):
         """Load and prepare audio file for playback, and copy it to project folder if needed"""
         try:
+            # Resolve path if it might be relative
+            if not os.path.isabs(file_path):
+                # Try to find it in the audio folder
+                potential_path = os.path.join(self.audio_folder, file_path)
+                if os.path.exists(potential_path):
+                    file_path = potential_path
+                elif os.path.exists(file_path):
+                    # It's a relative path from current directory
+                    file_path = os.path.abspath(file_path)
+                else:
+                    raise FileNotFoundError(f"File not found: {file_path}")
+            
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"File not found: {file_path}")
             
@@ -377,6 +406,15 @@ class EnhancedAudioPlayer(QMainWindow):
         
     def update_time(self):
         """Update current time and progress slider"""
+        # Handle pending seeks from throttling
+        if self.pending_seek is not None and self.player.get_media():
+            current_time = QDateTime.currentMSecsSinceEpoch()
+            if current_time - self.last_seek_time >= self.seek_throttle_ms:
+                self._perform_seek(self.pending_seek)
+                self.last_seek_time = current_time
+                self.pending_seek = None
+        
+        # Rest of your existing update_time code...
         if self.player.get_media():
             ms = self.player.get_time()
             length = self.player.get_length()
@@ -391,7 +429,7 @@ class EnhancedAudioPlayer(QMainWindow):
                     progress = int((ms / length) * 1000)
                     if not self.progress_slider.isSliderDown():  # Only update if user isn't dragging
                         self.progress_slider.setValue(progress)
-                        
+                
     def seek_audio(self, position):
         """Seek to specific position in audio with throttling"""
         if not self.player.get_media():
@@ -429,32 +467,6 @@ class EnhancedAudioPlayer(QMainWindow):
             if was_playing:
                 QTimer.singleShot(10, self.player.play)  # Small delay before resuming
 
-    def update_time(self):
-        """Update current time and progress slider"""
-        # Handle pending seeks from throttling
-        if self.pending_seek is not None and self.player.get_media():
-            current_time = QDateTime.currentMSecsSinceEpoch()
-            if current_time - self.last_seek_time >= self.seek_throttle_ms:
-                self._perform_seek(self.pending_seek)
-                self.last_seek_time = current_time
-                self.pending_seek = None
-        
-        # Rest of your existing update_time code...
-        if self.player.get_media():
-            ms = self.player.get_time()
-            length = self.player.get_length()
-            
-            if ms >= 0:
-                # Update time label
-                seconds = ms // 1000
-                self.current_time_label.setText(f"{seconds // 60:02d}:{seconds % 60:02d}")
-                
-                # Update progress slider
-                if length > 0:
-                    progress = int((ms / length) * 1000)
-                    if not self.progress_slider.isSliderDown():  # Only update if user isn't dragging
-                        self.progress_slider.setValue(progress)
-                
     def seek_relative(self, ms_offset):
         """Seek forward or backward by specified milliseconds"""
         if self.player.get_media():
@@ -556,10 +568,34 @@ class EnhancedAudioPlayer(QMainWindow):
             name = f"Bookmark at {time_ms // 1000}:{time_ms % 1000:03d}"
         
         bookmark_type = type_combo.currentText()
+        
+        # Convert to relative path if in audio folder
+        file_path = self.current_file
+        filename = os.path.basename(self.current_file)
+        
+        # Check if file is inside the audio folder
+        try:
+            audio_folder_abs = os.path.abspath(self.audio_folder)
+            file_path_abs = os.path.abspath(file_path)
             
+            if file_path_abs.startswith(audio_folder_abs):
+                # File is in audio folder, use relative path
+                relative_path = os.path.relpath(file_path_abs, audio_folder_abs)
+                # For direct files in audio folder, we want just the filename
+                if os.path.dirname(relative_path) == ".":
+                    stored_path = relative_path  # Just the filename
+                else:
+                    stored_path = relative_path  # Relative path from audio folder
+            else:
+                # File is outside audio folder, use full path
+                stored_path = file_path
+        except:
+            # If there's any error, fall back to full path
+            stored_path = file_path
+        
         bookmark = {
-            "file": self.current_file,
-            "filename": os.path.basename(self.current_file),
+            "file": stored_path,  # Use relative or full path
+            "filename": filename,
             "time_ms": time_ms,
             "name": name,
             "type": bookmark_type,
@@ -658,31 +694,79 @@ class EnhancedAudioPlayer(QMainWindow):
             
     def play_from_bookmark(self, item):
         """Play audio from selected bookmark position"""
-        if item and self.current_file:
-            bookmark = item.data(Qt.UserRole)
+        if not item:
+            return
             
-            # Skip if it's a header item (no UserRole data)
-            if not bookmark:
+        bookmark = item.data(Qt.UserRole)
+        
+        # Skip if it's a header item (no UserRole data)
+        if not bookmark:
+            return
+        
+        # Resolve the path (could be relative or absolute)
+        bookmark_path = self.resolve_bookmark_path(bookmark["file"])
+        
+        # Check if we need to load a new file
+        need_to_load_new_file = True
+        
+        # If we have a current file and it's the same as the bookmark file
+        if self.current_file and bookmark_path == self.current_file:
+            # Ask user if they want to seek in current file or load from beginning
+            reply = QMessageBox.question(
+                self,
+                "Bookmark Action",
+                f"This bookmark is for the current file.\n\n"
+                f"Would you like to:\n"
+                f"• Seek to bookmark position\n"
+                f"• Load fresh from bookmark",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # User chose to seek in current file
+                need_to_load_new_file = False
+                self.player.set_time(bookmark["time_ms"])
+                self.player.play()
+                self.play_pause_btn.setText("⏸ Pause")
+                self.statusBar().showMessage(f"Playing from bookmark: {bookmark['name']} ({bookmark.get('type', 'Regular')})", 3000)
                 return
+        
+        # If we need to load a new file (either no current file or different file)
+        if need_to_load_new_file:
+            # Stop current playback first
+            if self.player.is_playing():
+                self.player.stop()
             
-            # Check if bookmark is for current file
-            if bookmark["file"] != self.current_file:
-                reply = QMessageBox.question(
-                    self,
-                    "Different File",
-                    f"This bookmark is for '{bookmark['filename']}'.\n"
-                    f"Load this file instead?",
-                    QMessageBox.Yes | QMessageBox.No
-                )
+            # Load the file
+            self.load_audio_file(bookmark_path)
+            
+            # Wait for media to be loaded before setting time
+            # Use a polling approach to ensure media is ready
+            def delayed_seek_and_play():
+                if self.player.get_media() and self.player.get_length() > 0:
+                    # Media is loaded, set time and play
+                    self.player.set_time(bookmark["time_ms"])
+                    self.player.play()
+                    self.play_pause_btn.setText("⏸ Pause")
+                    self.statusBar().showMessage(f"Playing from bookmark: {bookmark['name']} ({bookmark.get('type', 'Regular')})", 3000)
+                else:
+                    # Media not ready yet, try again in 50ms
+                    QTimer.singleShot(50, delayed_seek_and_play)
+            
+            # Start the polling
+            QTimer.singleShot(100, delayed_seek_and_play)
+            
+            # If we need to load a new file (either no current file or different file)
+            if need_to_load_new_file:
+                # Load the file
+                self.load_audio_file(bookmark_path)
                 
-                if reply == QMessageBox.Yes:
-                    self.load_audio_file(bookmark["file"])
-            
-            # Seek to bookmark position
-            self.player.set_time(bookmark["time_ms"])
-            self.player.play()
-            self.play_pause_btn.setText("⏸ Pause")  # Update button to Pause
-            self.statusBar().showMessage(f"Playing from bookmark: {bookmark['name']} ({bookmark.get('type', 'Regular')})", 3000)
+                # Add small delay to ensure media is loaded before seeking and playing
+                QTimer.singleShot(300, lambda: self.player.set_time(bookmark["time_ms"]))
+                QTimer.singleShot(350, lambda: self.player.play())
+                QTimer.singleShot(350, lambda: self.play_pause_btn.setText("⏸ Pause"))
+                
+                self.statusBar().showMessage(f"Playing from bookmark: {bookmark['name']} ({bookmark.get('type', 'Regular')})", 3000)
             
     def delete_selected_bookmark(self):
         """Delete the selected bookmark"""
@@ -711,7 +795,7 @@ class EnhancedAudioPlayer(QMainWindow):
             
             # Find and remove the bookmark
             for i, b in enumerate(bookmarks):
-                if (b["file"] == bookmark["file"] and 
+                if (b["file"] == bookmark["file"] and  # Compare stored paths
                     b["time_ms"] == bookmark["time_ms"] and 
                     b["name"] == bookmark["name"]):
                     del bookmarks[i]
@@ -761,6 +845,9 @@ class EnhancedAudioPlayer(QMainWindow):
         if not bookmark:
             QMessageBox.warning(self, "Invalid Selection", "Please select a valid bookmark to edit.")
             return
+        
+        # Resolve the path for display purposes
+        bookmark_path = self.resolve_bookmark_path(bookmark["file"])
         
         # Create edit dialog
         dialog = QDialog(self)
@@ -825,7 +912,7 @@ class EnhancedAudioPlayer(QMainWindow):
         
         # Use current player time button (only if same file is loaded)
         use_current_time_btn = QPushButton("Use Current Time")
-        use_current_time_btn.setEnabled(self.current_file == bookmark['file'])
+        use_current_time_btn.setEnabled(self.current_file == bookmark_path)
         
         def update_time_display():
             new_time_ms = bookmark['time_ms'] + (time_spinbox.value() * 1000)
@@ -892,7 +979,7 @@ class EnhancedAudioPlayer(QMainWindow):
         # Find the bookmark to edit
         bookmark_index = -1
         for i, b in enumerate(bookmarks):
-            if (b["file"] == bookmark["file"] and 
+            if (b["file"] == bookmark["file"] and  # Compare stored paths
                 b["time_ms"] == bookmark["time_ms"] and 
                 b["name"] == bookmark["name"]):
                 bookmark_index = i
